@@ -12,6 +12,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 class TestGraph(unittest.TestCase):
     def setUp(self):
         self.agent = TicketAgent()
+        self.agent.client = None  # Force fast offline deterministic test execution
         self.graph = build_graph(self.agent, human_in_the_loop=False)
 
     def test_run_ticket_auto_handle(self):
