@@ -1,0 +1,19 @@
+Eval mode: FALLBACK (heuristic)
+Eval set size: 10 tickets
+
+ticket  gold_cat          pred_cat          cat   gold_pri  pred_pri  pri   conf  human?
+----------------------------------------------------------------------------------------
+T001    bug               bug               OK    high      high      OK    0.55  True
+T002    billing           billing           OK    high      high      OK    0.55  True
+T003    question          question          OK    low       low       OK    0.85  False
+T004    feature_request   feature_request   OK    low       low       OK    0.55  True
+T005    bug               bug               OK    urgent    urgent    OK    0.55  True
+T009    billing           billing           OK    high      high      OK    0.55  True
+T011    bug               bug               OK    urgent    urgent    OK    0.55  True
+T018    other             other             OK    low       low       OK    0.55  True
+T021    other             other             OK    urgent    urgent    OK    0.55  True
+T025    bug               bug               OK    high      high      OK    0.55  True
+
+Category accuracy: 10/10 (100%)
+Priority accuracy: 10/10 (100%)
+Both correct:      10/10 (100%)

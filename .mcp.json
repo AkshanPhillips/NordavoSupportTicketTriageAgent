@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/mcp.json",
+  "mcpServers": {
+    "ticket-database": {
+      "command": "python",
+      "args": ["-m", "mcp_server_sqlite", "--db-path", "./data/tickets.db"],
+      "description": "MCP server providing read/write access to customer ticket history and user tiers."
+    },
+    "knowledge-base": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./data"],
+      "description": "MCP server providing access to FAQ docs, billing policy documentation, and SLA guides."
+    }
+  }
+}

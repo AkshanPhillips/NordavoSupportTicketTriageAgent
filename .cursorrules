@@ -1,0 +1,27 @@
+# Cursor Rules for Support Ticket Triage Agent
+
+## Project Overview
+This repository contains a production-grade, human-in-the-loop support ticket triage agent built with LangGraph and Groq (using forced function calling).
+
+## Architecture Principles
+1. **Model Proposes, Safety-Net Disposes**:
+   - The LLM (`openai/gpt-oss-20b`) proposes category, priority, and optional draft reply.
+   - A deterministic, rule-based safety net (`apply_safety_net`) has the final veto over escalation.
+   - High-risk topics (refunds, security alerts, data loss, SSO/SAML, compliance/VAT) are ALWAYS routed to human review (`needs_human=True`).
+   - Bug and billing tickets are NEVER automated, even if the model suggests it.
+
+2. **Graph Structure (LangGraph)**:
+   - Pipeline: `START -> classify -> safety_net -> (route) -> auto_handle / human_queue -> END`
+   - In interactive review (`review.py`), `human_review` pauses execution using `interrupt()` with checkpointing.
+   - Batch runs (`run.py`, `eval.py`) compile the graph without the interruption node to guarantee unattended execution.
+
+3. **Code Style & Standards**:
+   - Python 3.9+ compatible.
+   - Type hints on all schemas and function signatures.
+   - Structured output via forced tool-calling schemas (`TRIAGE_TOOL_SCHEMA` in `schema.py`), never free-form JSON parsing.
+   - Keep dependencies lean: `groq`, `langgraph`, `python-dotenv`.
+
+4. **Testing & Verification**:
+   - Always run `python -m unittest discover tests` when modifying core logic.
+   - Run `python eval.py` to verify accuracy against the 10 gold-standard labeled tickets.
+   - Decisions are logged to `logs/decisions.jsonl` with structured timestamps and reasoning.

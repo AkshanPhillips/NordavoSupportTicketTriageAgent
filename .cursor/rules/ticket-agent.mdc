@@ -1,0 +1,19 @@
+---
+description: Architectural guidelines and coding standards for the Support Ticket Agent
+globs: src/**/*.py, *.py
+alwaysApply: true
+---
+
+# Agentic Engineering Guidelines
+
+## Core Invariants
+- **Deterministic Escalation**: Low confidence (< 0.75) or matching safety-net regex patterns (refunds, security, data loss, compliance, SAML) MUST force `needs_human=True`.
+- **Zero Hallucinated Actions**: Never permit automated replies (`can_auto_reply=True`) on `bug` or `billing` tickets.
+- **Clean Fallback**: All scripts must run end-to-end even in an environment with no `GROQ_API_KEY` using the deterministic fallback heuristic.
+- **Auditability**: Every decision must provide both `priority_reason` and (if escalated) `escalation_reason`.
+
+## Testing & Execution Commands
+- Batch run: `python run.py`
+- Evaluation benchmark: `python eval.py`
+- Human-in-the-loop CLI: `python review.py`
+- Unit tests: `python -m unittest discover tests`
