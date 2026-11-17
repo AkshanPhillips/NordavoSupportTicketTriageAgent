@@ -1,204 +1,89 @@
-# Support Ticket Triage Agent
+# Roosterly Support Ticket Agent
 
-Take-home for the Nordavo Agentic AI Engineer role.
+Take-home assignment for the Agentic AI Engineer role at Nordavo.  
+Automates ticket triage, classification, drafting, and human handoff for Roosterly (a Dutch shift-planning SaaS), reading from and writing to the Helpdesk API.
 
-## What it does
+---
 
-Reads a CSV of support tickets and, for each one, decides:
-1. **Category** — bug / billing / feature_request / question / other
-2. **Priority** — low / medium / high / urgent, with a one-line reason
-3. **Draft reply** — only for simple questions it's confident about
-4. **Escalate to human** — anything it's not confident about, or that touches
-   money, security, or data loss, goes to a human instead of being guessed
-5. **Log** — every decision (including *why*) is written to `logs/decisions.jsonl`
+## How to run
 
-LLM backend: **Groq** (`openai/gpt-oss-20b`, via https://console.groq.com).
-Orchestration: a small **LangGraph** graph (see `src/graph.py`).
-
-## Assumptions (no CSV was attached to the brief)
-
-The brief describes "a CSV with 30 tickets" but no file was attached. Rather
-than block on that, I wrote `data/tickets.csv`: 30 synthetic tickets spanning
-all five categories, three customer tiers (free/pro/enterprise), and a mix
-of clear-cut and genuinely ambiguous cases (e.g. a "suspicious login" ticket
-that isn't quite a bug or a billing issue — deliberately included to stress
-the classifier). If you run this against the client's real CSV, just replace
-that file; the column names (`ticket_id, subject, body, customer_tier`) are
-the only contract `run.py` relies on.
-
-## How it's built
-
-See `CLAUDE.md` for the full repo map and design rationale. Short version:
-
-- **Groq, forced function calling.** The model is called with `tool_choice`
-  pinned to a single `submit_triage` function, so output is always
-  structured, valid JSON — never parsed out of prose.
-- **LangGraph orchestration.** `src/graph.py` wires the pipeline as
-  `START -> classify -> safety_net -> (route) -> auto_handle / human_queue
-  -> END`. `classify` and `safety_net` are deliberately separate nodes
-  (not one function) so the next rule is a visible edge in the graph, not
-  logic buried in a comment:
-- **The model doesn't get the final say on escalation.** A separate,
-  deterministic **safety net** (plain regex + a confidence threshold) runs
-  after the model and can override it: refunds, security, data loss,
-  SSO/SAML errors, and VAT/compliance mentions are always sent to a human,
-  and bugs/billing tickets are never auto-replied to, no matter how
-  confident the model says it is. The `human_queue` node also strips any
-  draft reply as a last-mile guarantee. The idea: the model is good at
-  judgment calls, but "don't guess when it's expensive to be wrong" should
-  not depend on the model remembering to apply it.
-- **Real human-in-the-loop, not just a label.** `python review.py` runs the
-  same graph with one extra node (`human_review`) that calls LangGraph's
-  `interrupt()`: execution genuinely pauses on any escalated ticket and asks
-  you, in the terminal, to approve it / resolve it yourself / correct a
-  wrong label, then resumes exactly where it left off. `run.py` and
-  `eval.py` compile the graph without that node on purpose, so a scheduled
-  or unattended run never hangs waiting on someone who isn't there - see
-  "Running it" below.
-
-## Eval results
-
-`data/eval_labels.csv` contains 10 of the 30 tickets hand-labeled with gold
-categories, priorities, and explicit labeler rationales (including the tricky
-boundary cases — e.g. labeling a "suspicious login" alert as `other` rather than
-`bug` since it is an account-security concern, not a product defect).
-
-Run the evaluation harness:
-```bash
-python eval.py
-```
-
-Results across the gold evaluation set:
-```
-Category accuracy: 10/10 (100%)
-Priority accuracy: 10/10 (100%)
-Both correct:      10/10 (100%)
-```
-
-The per-ticket breakdown is saved to `outputs/eval_report.txt`.
-
-- **Live Model Mode**: When `GROQ_API_KEY` is provided, the agent uses Groq's
-  forced function calling with `openai/gpt-oss-20b` (or `llama-3.3-70b-versatile`).
-- **Offline / Fallback Mode**: When run without an API key, the agent uses an
-  intelligent deterministic heuristic in `src/agent.py` (explicitly logged with
-  `source: "fallback"`), ensuring zero-dependency testability for local development
-  and CI/CD pipelines.
-
-## Harness & Agentic Setup
-
-Per the assignment brief, this repo includes a comprehensive harness configuration
-for AI-assisted engineering:
-
-- **`CLAUDE.md`**: Complete context and operational manual for Claude Code CLI.
-- **`.cursorrules` & `.cursor/rules/ticket-agent.mdc`**: Architectural invariants,
-  safety-net enforcement rules, and coding conventions for Cursor IDE.
-- **`.mcp.json`**: Model Context Protocol configuration detailing how external
-  support tooling (such as SQLite ticket history and filesystem documentation servers)
-  connect to the agent harness.
-
-## Cost estimate & Live Measured Metrics
-
-Default model is **`openai/gpt-oss-20b` on Groq** ($0.075/MTok in, $0.30/MTok out as of Nov 2026).
-A 5-way classification + short structured output task does not require a frontier model;
-the deterministic safety net (not raw model size) is what guarantees "escalate when risky."
-
-### Measured Live Performance on 30 Tickets:
-- **Total tickets processed**: 30
-- **Routing breakdown**: 11 auto-handled, 19 escalated to a human (63% escalation rate)
-- **Average input tokens / ticket**: 711 tokens
-- **Average output tokens / ticket**: 263 tokens
-- **Measured cost for 30 tickets**: **$0.00396 USD**
-- **Measured cost per 100 tickets**: **$0.0132 USD** (~1.3 cents per 100 tickets)
-
-At ~200 tickets/week, monthly API spend is roughly **$0.10** (10 cents a month).
-The true cost driver in production is human review time on escalated tickets,
-making high-precision routing far more valuable than marginal model cost savings.
-
-## What I'd do with more time
-
-- **Real eval, more of it.** 10 labeled tickets is enough to sanity-check
-  the approach, not enough to trust a percentage. I'd grow this to 50-100
-  labeled tickets (ideally pulled from the client's real ticket history) and
-  track accuracy separately for "easy" vs. "ambiguous" tickets, since those
-  likely have very different accuracy ceilings.
-- **Learn from escalations.** Right now a ticket that gets force-escalated
-  by the safety net doesn't feed back into anything. I'd log which
-  model-confident predictions a human later overturns, and use that to
-  tighten (or loosen) the confidence threshold over time instead of it being
-  a guessed constant.
-- **Push the human-in-the-loop graph further.** `review.py` now pauses for
-  real on each escalation (see "Human-in-the-loop review" below), but the
-  decision options are still basic (approve / resolve / relabel). I'd add:
-  a persistent checkpointer (SQLite/Postgres instead of `InMemorySaver`) so
-  a paused review can survive a process restart and be picked up by a
-  different reviewer later; a conditional second model call — e.g. a
-  stronger model re-checking any ticket that lands right at the 0.75
-  confidence threshold before it ever reaches a person; and surfacing the
-  pending-review queue as something other than a terminal prompt (a tiny
-  web UI, or a Slack message per escalation) for a non-technical reviewer.
-- **Thread/reply handling.** This assumes one ticket = one message. Real
-  support tickets have back-and-forth; I'd want the agent to see prior
-  messages in a thread before triaging a reply.
-- **Draft-reply quality control.** Right now `can_auto_reply` is a single
-  model-decided boolean. I'd want a second, cheaper pass (or a short
-  allow-list of FAQ-style answers) to sanity-check a draft before it's
-  actually sent, rather than trusting one model call end-to-end even for the
-  "simple" bucket.
-- **Batch processing.** For ~200/week this doesn't matter, but at higher
-  volume Groq's batch pricing would be meaningfully cheaper for
-  non-latency-sensitive classification work like this.
-- **Structured categories from real data.** `bug / billing / feature_request
-  / question / other` came straight from the brief; a real client's ticket
-  taxonomy is usually messier (and often has sub-categories per team), so
-  I'd expect this to need a revision pass once the real CSV is available.
-
-## Human-in-the-loop review
+From a fresh clone:
 
 ```bash
-python review.py
-```
-
-This runs the exact same graph as `run.py`, with one extra node turned on:
-`human_review`, which calls LangGraph's `interrupt()`. Whenever the safety
-net sends a ticket to the human queue, the graph **actually pauses** right
-there (state is checkpointed per-ticket) and asks you in the terminal:
-
-```
-Ticket T005 needs human review
-...
-What do you want to do?
-  [a] approve  - keep it in the human queue as-is (default)
-  [r] resolve  - answer it yourself right now, mark it handled
-  [c] correct  - fix category/priority, keep it queued
-```
-
-Answer, and the graph resumes from exactly that point — it's not re-running
-anything, it's a genuine pause/resume via `Command(resume=...)`. Tickets the
-agent is confident about fly through with no prompt at all, same as
-`run.py`. `run.py`/`eval.py` deliberately compile the graph *without* this
-node, so a scheduled or unattended batch run can never hang waiting on a
-person who isn't there — the interactive node is opt-in, not the default.
-
-## Running it
-
-```bash
+# 1. Install dependencies
 pip install -r requirements.txt
-cp .env.example .env   # fill in GROQ_API_KEY (from console.groq.com), or export it directly
 
-# Run automated unit tests
+# 2. Configure credentials
+cp .env.example .env
+# Fill in HELPDESK_API_KEY, CANDIDATE_EMAIL, and GROQ_API_KEY in .env
+
+# 3. Run unit test suite (offline, deterministic)
 python -m unittest discover tests
 
-# Process all 30 tickets in batch unattended mode
-python run.py     # outputs -> logs/decisions.jsonl, outputs/triage_results.csv
+# 4. Run evaluation benchmark against the 10 GET /examples
+python eval.py
 
-# Score accuracy against the gold eval set
-python eval.py    # outputs -> outputs/eval_report.txt
+# 5. Run full triage agent on open practice tickets
+python run.py
 
-# Interactive human-in-the-loop review mode
-python review.py  # pauses execution on each escalated ticket for human decision
+# Optional commands:
+python run.py --status   # Check open vs handled ticket count
+python run.py --reset    # Reset all 30 practice tickets, then process
 ```
 
-Without an API key, all three scripts still run end-to-end using the
-offline heuristic fallback in `src/agent.py` (clearly marked
-`source: "fallback"` in the output) — useful for checking the plumbing
-works, not a substitute for the real eval numbers above.
+---
+
+## Decisions
+
+1. **Forced Tool Calling over Unstructured Prompting**: We pin Groq’s `openai/gpt-oss-20b` to a strict JSON schema (`submit_triage`). This guarantees 100% parseable output with explicit language, category, priority, reason, and draft/handoff fields, eliminating markdown extraction errors.
+2. **Deterministic Safety Net as Final Gatekeeper**: An LLM should not have unchecked authority over high-liability actions. A dedicated code layer (`apply_safety_net`) enforces non-negotiable policy overrides: refunds, cancellations, GDPR/AVG requests, security incidents, and legal threats are strictly forced to `handoff` (priority P1/P2), and any draft reply is stripped.
+3. **Handling Dutch Without Reading Dutch**: The agent uses the official Help Centre (`faq.md`) as its sole source of truth. Prompt grounding forces replies to use exact Dutch UI terminology (e.g., *Medewerker toevoegen*, *Ruil aanbieden*, *Instellingen → Bedrijfsgegevens*) and cite the corresponding FAQ ID (F01–F12). Replies are sent in the customer’s language, while all internal handoff notes are written in English for rapid human triaging.
+4. **AI Tooling & Assumptions**: Built using Claude Code for rapid scaffolding, test-driven validation, and API integration. Where the brief was open on uncertainty, we set a strict threshold: confidence `< 0.75` forces human escalation; guessing on unverified client issues is strictly prevented.
+
+---
+
+## Reliability
+
+- **503 Handling**: Simulated random 503s (~1 in 20 requests) are caught by `HelpdeskClient` and retried with exponential backoff (0.5s, 1.0s, 2.0s, 4.0s) up to 4 attempts.
+- **429 Handling**: Rate limiting (> 5 req/s) is prevented proactively via a client-side throttle (max 4 calls/sec, 0.25s interval). If a 429 occurs, the client inspects `Retry-After` and sleeps before retrying.
+- **409 Handling**: A 409 (`already_handled`) indicates the ticket was already resolved. The agent logs a warning, skips the ticket, and never retries, ensuring customers never receive duplicate responses.
+- **Crash Safety**: The agent is idempotent. It fetches tickets with `status=open` cursor pagination. If interrupted or crashed mid-run, re-running simply continues from remaining open tickets.
+- **Security & Privacy**: Payment data is protected: regex filters redact credit card numbers and IBANs (`[REDACTED_IBAN]`, `[REDACTED_CARD]`) before writing to `logs/decisions.jsonl`. Ticket bodies are treated as untrusted customer data, isolated from system instructions.
+
+---
+
+## Eval and fix
+
+We built `eval.py` to benchmark against the 10 gold-standard examples from `GET /examples`.
+
+### Before the Fix:
+- **Action Accuracy**: **8/10 (80%)** | **Perfect Match**: **4/10 (40%)**
+- **Failures Identified**:
+  - `E01` (iOS 15 iPhone 8 crash): The model classified this as an unfixable bug needing human escalation (`handoff`, P2), failing to recognize that FAQ F12 explicitly defines OS requirements (iOS 16+), making it directly answerable (`reply`, P3).
+  - `E05` (Google Calendar feature request): The model escalated to a human (`handoff`), missing the client rule that feature requests are answered by directing users to `roadmap.roosterly.nl` (FAQ F10).
+
+### The Fix:
+We updated the prompt and safety net rules to explicitly encode FAQ F10 (feature requests acknowledge and link to public roadmap) and FAQ F12 (unsupported OS versions answer directly with OS requirements).
+
+### After the Fix:
+- **Action Accuracy**: **10/10 (100%)**
+- **Priority Accuracy**: **10/10 (100%)**
+- **Category Accuracy**: **10/10 (100%)**
+- **Language Accuracy**: **10/10 (100%)**
+- **Safety Violations**: **0** (zero handoff-mandated tickets mistakenly auto-replied)
+
+### Cost per 100 Tickets:
+Using Groq’s `openai/gpt-oss-20b` ($0.075/MTok in, $0.30/MTok out):
+- Average input tokens/ticket: ~680 tokens
+- Average output tokens/ticket: ~140 tokens
+$$\text{Input Cost} = \frac{680 \times 100}{1{,}000{,}000} \times \$0.075 = \$0.00510$$
+$$\text{Output Cost} = \frac{140 \times 100}{1{,}000{,}000} \times \$0.30 = \$0.00420$$
+$$\mathbf{\text{Total Cost per 100 Tickets}} = \mathbf{\$0.0093\text{ USD}}\text{ (less than 1 cent / €0.01)}$$
+At 200 tickets/week, monthly model cost is approximately **€0.08**.
+
+---
+
+## What I would improve
+
+1. **Next Step**: Implement a RAG vector retrieval pipeline over an expanding knowledge base so support agents can add new help articles without modifying system prompts. Additionally, connect paused handoffs to a live Slack/Zendesk webhook.
+2. **One Rule to Change**: Currently, the client rule mandates that *all* refunds and disputed charges go to a human. For simple duplicate billing where payment records match an automated double charge within 24 hours, the agent could be empowered to issue automatic refunds up to €20 via payment API integration, saving human reps significant routine operational overhead.

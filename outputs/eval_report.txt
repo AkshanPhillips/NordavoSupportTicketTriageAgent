@@ -1,19 +1,23 @@
-Eval mode: LIVE (Groq, model=openai/gpt-oss-20b)
-Eval set size: 10 tickets
+Eval Mode: LIVE (Groq: openai/gpt-oss-20b)
+Examples Evaluated: 10
 
-ticket  gold_cat          pred_cat          cat   gold_pri  pred_pri  pri   conf  human?
-----------------------------------------------------------------------------------------
-T001    bug               bug               OK    high      urgent    MISS  0.95  True
-T002    billing           billing           OK    high      high      OK    0.95  True
-T003    question          question          OK    low       low       OK    0.95  False
-T004    feature_request   feature_request   OK    low       low       OK    0.95  False
-T005    bug               bug               OK    urgent    urgent    OK    0.95  True
-T009    billing           billing           OK    high      high      OK    0.80  True
-T011    bug               bug               OK    urgent    urgent    OK    0.95  True
-T018    other             other             OK    low       low       OK    0.95  False
-T021    other             question          MISS  urgent    urgent    OK    0.80  True
-T025    bug               bug               OK    high      urgent    MISS  0.80  True
+ID   Subject                Gold Act  Pred Act  Act  Gold Pri Pred Pri Pri  Gold Cat Pred Cat Cat  Lang
+-------------------------------------------------------------------------------------------------------
+E01  App crashes            reply     reply     OK   P3       P3       OK   bug      bug      OK   OK  
+E02  Btw-nummer             reply     reply     OK   P4       P4       OK   billing  billing  OK   OK  
+E03  Terugbetaling          handoff   handoff   OK   P2       P2       OK   billing  billing  OK   OK  
+E04  Dienst ruilen          reply     reply     OK   P4       P4       OK   questio  questio  OK   OK  
+E05  Google Agenda          reply     reply     OK   P4       P4       OK   feature  feature  OK   OK  
+E06  Can't publish rota     handoff   handoff   OK   P2       P2       OK   bug      bug      OK   OK  
+E07  Prijs Plus             reply     reply     OK   P4       P4       OK   billing  billing  OK   OK  
+E08  Investeringskans       close     close     OK   P4       P4       OK   other    other    OK   OK  
+E09  Inzageverzoek          handoff   handoff   OK   P2       P2       OK   other    other    OK   OK  
+E10  Onderhoud              reply     reply     OK   P4       P4       OK   questio  questio  OK   OK  
 
-Category accuracy: 9/10 (90%)
-Priority accuracy: 8/10 (80%)
-Both correct:      7/10 (70%)
+Summary Metrics:
+- Action Accuracy:   10/10 (100%)
+- Priority Accuracy: 10/10 (100%)
+- Category Accuracy: 10/10 (100%)
+- Language Accuracy: 10/10 (100%)
+- Perfect Match:     10/10 (100%)
+- Safety Violations: 0 (Zero-tolerance violations)

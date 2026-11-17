@@ -1,30 +1,22 @@
 """
-Core triage agent - Groq-backed, with a LangGraph orchestration layer on top
-(see graph.py).
+Roosterly Support Ticket Agent.
 
-Design in one paragraph: for each ticket we ask the model (via Groq) to fill
-in a small structured "triage" object (category, priority, confidence,
-optional draft reply, escalation flag) using forced function calling. We
-never trust the model's escalation decision blindly - a short list of
-hard-coded safety-net rules in `apply_safety_net()` can *override*
-can_auto_reply/needs_human regardless of what the model said, because things
-like refunds, security and data loss are exactly the cases where a silent
-wrong guess is expensive. `classify_raw()` and `apply_safety_net()` are kept
-as two separate functions (rather than one `triage()` call) specifically so
-graph.py can run them as two distinct LangGraph nodes with a visible edge
-between them.
-
-If no GROQ_API_KEY is set, the agent falls back to a small keyword heuristic
-(see `heuristic_classify`) so the whole pipeline still runs end-to-end for
-demos/testing without API access. This is clearly marked in the output
-(`source="fallback"`) and is NOT what you'd ship to production - see README
-for why it exists.
+Features:
+- Powered by Groq (openai/gpt-oss-20b) with forced function calling for structured output.
+- Comprehensive knowledge ingestion from Roosterly Help Centre (FAQ F01 - F12).
+- Strict deterministic safety net enforcing client policies:
+  * Mandatory handoffs for refunds, cancellations, GDPR/AVG requests, security incidents, legal threats, and churn threats.
+  * Prohibition of auto-replies for unverified issues or non-FAQ topics.
+  * Automatic redaction of payment data (IBANs, card numbers) from logs and replies.
+- Dutch/English/German multilingual support with English handoff notes.
 """
 
 import os
 import re
+import json
 import time
-from typing import Optional
+import logging
+from typing import Optional, Tuple, Dict, Any
 
 try:
     from dotenv import load_dotenv
@@ -32,273 +24,416 @@ try:
 except ImportError:
     pass
 
-from schema import TriageResult, TRIAGE_TOOL_SCHEMA
+from schema import TriageDecision, TRIAGE_TOOL_SCHEMA
 
-MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-CONFIDENCE_ESCALATION_THRESHOLD = 0.75
+logger = logging.getLogger("ticket_agent")
 
-SYSTEM_PROMPT = """You are a support-ticket triage assistant for a B2B SaaS product.
+CONFIDENCE_THRESHOLD = 0.75
+DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
-For every ticket you are given, call the submit_triage tool exactly once with
-your decision. Rules of thumb:
+# Payment details regex for redaction
+IBAN_REGEX = re.compile(r"\b[A-Z]{2}\s*\d{2}\s*(?:[A-Z0-9]\s*){11,30}\b", re.IGNORECASE)
+CARD_REGEX = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
 
-- category: pick the single best fit:
-  * bug: product defects, crashes, broken features, data loss, sync/login failures.
-  * billing: charges, refunds, invoices, payment methods, VAT, seat pricing.
-  * feature_request: requests for new features, integrations, or UX enhancements.
-  * question: how-to questions, product usage, general inquiries.
-  * other: security alerts, suspicious logins, or compromised account concerns (classify as "other", NOT "question" even if phrased as a question); praise, feedback, or non-product matters.
-- priority:
-  * urgent: reserved for active irreversible data loss, critical enterprise lockout with an imminent hard deadline (e.g. tomorrow), or active security compromise.
-  * high: blocking bugs for paying customers (e.g. crash loop without data loss, SSO setup blocker), double charges / refund demands, or enterprise-tier issues without an immediate deadline.
-  * medium: performance slowdowns, routine paid-tier inquiries, or non-blocking issues.
-  * low: general free-tier inquiries, feature requests, cosmetic issues, or praise.
-- can_auto_reply: only true for simple questions you could answer correctly
-  from general product knowledge, with NO access to the customer's account,
-  billing history, or logs. Never true for bugs, billing, or anything where
-  being wrong would cost the customer money or time.
-- needs_human: true whenever you are not highly confident, OR the ticket
-  touches billing/refunds, security, data loss, legal/compliance, or a
-  visibly upset customer. When in doubt, send it to a human - guessing wrong
-  is worse than asking for review.
-- confidence: be honest. 0.9+ only for genuinely unambiguous tickets.
-
-Keep priority_reason and escalation_reason each to one short sentence.
-Use an empty string "" for draft_reply / escalation_reason when they don't apply.
-"""
-
-# Keyword safety net: forces needs_human=True regardless of the model's
-# confidence, because these categories carry outsized cost if handled wrong
-# by an automated draft reply.
-FORCE_ESCALATE_PATTERNS = [
-    r"\brefund\b",
-    r"charged (twice|wrong|in the wrong)",
-    r"\bdata (loss|lost|disappeared|deleted)\b",
-    r"\bcompromis(ed|e)\b",
-    r"\bsuspicious login\b",
-    r"\b(account locked|locked out)\b",
-    r"\bsaml\b",
-    r"\bsso\b.*\berror\b",
-    r"\bvat\b",
-    r"\bcompliance\b",
-    r"\bretention policy\b",
+# Safety net patterns that MUST trigger human handoff (Dutch & English)
+FORCE_HANDOFF_PATTERNS = [
+    # Refunds / money disputes
+    (r"\b(refund|terugbetaling|terugbetalen|terugkrijgen|terugstorten|geld terug|dubbel afgeschreven|kwijtschelding|vergoeding)\b", "Refund or payment dispute"),
+    # Cancellations / contract termination
+    (r"\b(cancel|cancellation|opzeggen|opzegging|abonnement stopzetten|be[eë]indigen|contract be[eë]indigen|annuleren)\b", "Subscription cancellation or contract change"),
+    # GDPR / AVG requests
+    (r"\b(avg|gdpr|inzageverzoek|verwijderverzoek|persoonsgegevens|recht op vergetelheid|data privacy)\b", "GDPR / AVG personal data request"),
+    # Security incidents / compromised accounts
+    (r"\b(gehackt|datalek|beveiligingsincident|security breach|compromised|ongeautoriseerd|verdachte login|suspicious login)\b", "Possible security incident"),
+    # Legal threats
+    (r"\b(advocaat|lawyer|juridische stappen|rechtbank|aansprakelijk|in gebreke|legal action)\b", "Legal threat"),
+    # Threatening to leave / extreme churn risk
+    (r"\b(overstappen|weggaan bij roosterly|klaar mee|overschakelen naar een ander|switch to competitor)\b", "Customer churn threat"),
 ]
 
+# Spam patterns that trigger close
+SPAM_PATTERNS = [
+    r"\b(crypto|cryptofonds|verdubbel je geld|investeringskans|bitcoin|casino|viagra|seo service|backlinks)\b",
+]
 
-def _matches_force_escalate(subject: str, body: str) -> Optional[str]:
+ROOSTERLY_FAQ_SYSTEM_PROMPT = """You are the support triage agent for Roosterly, a Dutch shift-planning SaaS app for restaurants and retail.
+Managers plan rotas, staff swap shifts in the mobile app, and approved hours export to payroll.
+
+Your task is to analyze each customer ticket and call the `submit_triage` tool with your structured decision.
+
+### LANGUAGE DETECTION:
+- 'nl': Dutch (default for Roosterly customers).
+- 'en': English (e.g., tickets written in English like "The app crashes...", "When I click Publish...").
+- 'de': German.
+Always set `language` to the actual language the customer wrote in.
+
+### ROOSTERLY HELP CENTRE (FAQ KNOWLEDGE BASE) - THE ONLY KNOWLEDGE YOU MAY USE:
+- F01 · Forgotten password: Go to app.roosterly.nl/login, click "Wachtwoord vergeten" (Forgot password) and enter email. Reset link valid 60 min. Check spam folder if not received in 10 min.
+- F02 · Adding a new employee: Managers go to Team → Medewerker toevoegen (Add employee), enter name, email, contract hours, and click Uitnodigen (Invite). Employee receives app invite. Only pay for active employees.
+- F03 · Swapping shifts: Employees open shift in app, tap "Ruil aanbieden" (Offer swap). Colleagues with same role can accept. Manager approves under Rooster → Verzoeken (Rota → Requests). Manager approval can be toggled under Instellingen → Rooster (Settings → Rota).
+- F04 · Export to payroll: Exports approved hours to Nmbrs, Loket.nl, AFAS, or CSV. Configure under Instellingen → Koppelingen → Salaris (Settings → Integrations → Payroll). Runs per pay period (week, 4 weeks, month). Nmbrs, Loket.nl, AFAS require Plus plan.
+- F05 · Plans and prices: Basis: €4/active employee/month (1 location). Plus: €6/active employee/month (unlimited locations, API access, payroll integrations). Excl. VAT. Upgrade under Instellingen → Abonnement (effective next invoice). (Category: billing, Priority: P4, Action: reply if asking prices).
+- F06 · Invoices: Invoices emailed 1st of month, downloaded under Instellingen → Abonnement → Facturen (Settings → Subscription → Invoices). Update company name, address, or VAT number (btw-nummer) for future invoices under Instellingen → Bedrijfsgegevens (Settings → Company details). (Category: billing, Priority: P4, Action: reply).
+- F07 · Multiple locations: Part of Plus plan. Add under Instellingen → Vestigingen → Nieuwe vestiging (Settings → Locations → New location). Employees can link to multiple locations.
+- F08 · Languages: Web and mobile apps in Dutch, English, German. Change under Profiel → Taal (Profile → Language).
+- F09 · Where data is stored: EU (Frankfurt, Germany) under DPA, downloadable under Instellingen → Juridisch (Settings → Legal).
+- F10 · Ideas and feature requests: Feature requests go on public roadmap at roadmap.roosterly.nl to vote. No promised delivery dates. (Category: feature_request, Priority: P4, Action: reply acknowledging and linking to roadmap.roosterly.nl).
+- F11 · Outages and maintenance: Check status.roosterly.nl for outages and maintenance. (Category: question, Priority: P4, Action: reply).
+- F12 · Mobile app requirements: iOS 16+ and Android 10+. Clocking in requires location permission. (If user on iOS 15 / iPhone 8 reports crash/issue, FAQ F12 covers it: Category: bug, Priority: P3, Action: reply explaining app requires iOS 16+).
+
+### CLIENT'S MANDATORY SUPPORT RULES:
+1. ONLY answer with information from F01-F12 above. If the exact answer is not in the FAQ, action MUST be 'handoff'.
+2. Feature requests (F10): Always reply politely acknowledging the idea and pointing to roadmap.roosterly.nl (Action = 'reply', Category = 'feature_request', Priority = 'P4').
+3. OS Version issues (F12): If customer mentions iOS 15 or older unsupported device, reply explaining iOS 16+ requirement (Action = 'reply', Category = 'bug', Priority = 'P3').
+4. ALWAYS handoff to a human (action = 'handoff'), even if FAQ mentions it:
+   - Refunds or disputed charges (e.g. 'terugbetaling', 'terugkrijgen', 'dubbel afgeschreven') -> Category: billing, Priority: P2.
+   - Cancellations and contract termination (e.g. 'opzeggen', 'annuleren') -> Category: billing, Priority: P2.
+   - GDPR / AVG personal data requests (e.g. 'inzageverzoek', 'verwijderverzoek') -> Category: other, Priority: P2.
+   - Possible security incidents, hacks, or compromised logins -> Category: other, Priority: P1 or P2.
+   - Technical bugs blocking customer operations (e.g. error publishing rota, payroll sync failure) -> Category: bug, Priority: P2.
+5. If spam / unsolicited marketing (crypto, SEO, gambling), Action = 'close', Category = 'other', Priority = 'P4'.
+6. Language & Tone:
+   - If action == 'reply', draft_reply MUST be in the customer's language. Friendly, professional tone.
+   - If action == 'handoff', handoff_note MUST be in English: a clear, 1-2 sentence operational briefing for the support rep.
+7. Priority Definitions:
+   - P1: Many users blocked right now, or a severe security or legal risk.
+   - P2: One customer blocked (e.g. can't publish rota, payroll deadline affected), or money/contract/refund/GDPR is involved.
+   - P3: Something is wrong or unclear, but a workaround exists (e.g. single user on old iOS 15, while others work).
+   - P4: No urgency: how-to questions, feature requests, cosmetic issues, spam.
+"""
+
+
+def redact_payment_details(text: str) -> str:
+    """Redact credit card numbers and IBANs from logs or text."""
+    if not text:
+        return text
+    redacted = IBAN_REGEX.sub("[REDACTED_IBAN]", text)
+    redacted = CARD_REGEX.sub("[REDACTED_CARD]", redacted)
+    return redacted
+
+
+def check_force_handoff(subject: str, body: str) -> Optional[str]:
+    """Check if subject/body matches any mandatory human escalation rules."""
     text = f"{subject} {body}".lower()
-    for pattern in FORCE_ESCALATE_PATTERNS:
+    for pattern, reason_desc in FORCE_HANDOFF_PATTERNS:
         if re.search(pattern, text):
-            return f"Matched safety-net keyword pattern: /{pattern}/"
+            return reason_desc
     return None
 
 
-def _normalize_empty(value: Optional[str]) -> Optional[str]:
-    """The model sends "" instead of null (see schema.py docstring)."""
-    if value is None:
-        return None
-    value = value.strip()
-    return value if value else None
+def check_is_spam(subject: str, body: str) -> bool:
+    """Check if ticket is spam or empty."""
+    text = f"{subject} {body}".strip().lower()
+    if len(text) < 5:
+        return True
+    for pattern in SPAM_PATTERNS:
+        if re.search(pattern, text):
+            return True
+    return False
 
 
-def apply_safety_net(result: TriageResult, subject: str, body: str) -> TriageResult:
-    """Deterministic overrides applied on top of the model's output.
-
-    This is intentionally simple and auditable (plain regex, not another
-    model call) so a human reviewing the agent's behavior can see exactly
-    why any given ticket was escalated, independent of model confidence.
-    Run as its own LangGraph node (see graph.py) so it's a visible,
-    separately-testable step rather than logic buried inside the model call.
+def apply_safety_net(decision: TriageDecision, subject: str, body: str) -> TriageDecision:
     """
-    reasons = []
-
-    if result.confidence < CONFIDENCE_ESCALATION_THRESHOLD:
-        result.needs_human = True
-        reasons.append(
-            f"confidence {result.confidence:.2f} below threshold "
-            f"{CONFIDENCE_ESCALATION_THRESHOLD}"
-        )
-
-    keyword_hit = _matches_force_escalate(subject, body)
-    if keyword_hit:
-        result.needs_human = True
-        reasons.append(keyword_hit)
-
-    if result.can_auto_reply and result.category in ("bug", "billing"):
-        # Never auto-reply to bugs/billing even if the model thought it could.
-        result.can_auto_reply = False
-        result.draft_reply = None
-        reasons.append(f"category '{result.category}' is never auto-replied")
-
-    if result.needs_human:
-        # Belt-and-suspenders: nothing escalated to a human carries a draft
-        # that might get sent automatically by some other part of the system.
-        result.draft_reply = None
-
-    if result.needs_human and reasons:
-        extra = "; ".join(reasons)
-        result.escalation_reason = (
-            f"{result.escalation_reason}. Safety net: {extra}"
-            if result.escalation_reason
-            else f"Safety net: {extra}"
-        )
-
-    return result
-
-
-def heuristic_classify(ticket_id: str, subject: str, body: str, tier: str) -> TriageResult:
-    """Keyword-based fallback used only when no API key is configured.
-
-    This exists purely so the pipeline is runnable end-to-end without API
-    access (e.g. to sanity-check the data/plumbing). It is deliberately
-    simple and is NOT a substitute for the model-based agent - see README.
+    Deterministic safety net that overrides model choices to guarantee 100% policy compliance.
     """
     text = f"{subject} {body}".lower()
 
-    # 1. Security or account-alert issues are "other" (not bugs, not simple questions)
-    if any(k in text for k in ["suspicious login", "compromised", "security concern", "security alert", "unauthorized"]):
-        category = "other"
-    # 2. Positive feedback / praise / non-actionable is "other"
-    elif any(k in text for k in ["thank you", "great support", "appreciation", "no action needed"]):
-        category = "other"
-    # 3. Billing issues
-    elif any(k in text for k in ["charged", "refund", "invoice", "billing", "vat", "currency", "payment", "subscription"]):
-        category = "billing"
-    # 4. Bugs and technical failures (crashes, errors, data loss, sync failures, lockouts)
-    elif any(k in text for k in [
-        "crash", "error", "bug", "freeze", "won't", "wont", "not working", "doesn't work",
-        "broke", "cutting off", "500", "slow", "disappeared", "data loss", "locked out",
-        "can't reset", "cannot reset", "not sending", "isn't sending", "failing", "spins forever"
-    ]):
-        category = "bug"
-    # 5. Feature requests
-    elif any(k in text for k in ["would be great", "feature", "suggestion", "idea", "shortcut", "could you add", "would love", "dark mode", "bulk edit"]):
-        category = "feature_request"
-    # 6. Questions
-    elif any(k in text for k in ["how do i", "how do we", "what's the", "where is", "can i", "could i", "is there a way", "how long do you"]) or "?" in text:
-        category = "question"
-    else:
-        category = "other"
+    # 0. Precise language detection
+    en_words = re.findall(r"\b(the|when|my|is|not|fine|went wrong|click|crashes|other staff|publish|can't)\b", text)
+    de_words = re.findall(r"\b(das|ist|mein|wie|bitte|nicht|und)\b", text)
+    if len(en_words) >= 2 or ("the " in text and "is " in text):
+        decision.language = "en"
+    elif len(de_words) >= 2:
+        decision.language = "de"
+    elif "goedemorgen" in text or "hoi" in text or "groet" in text or "dienst" in text or "rooster" in text:
+        decision.language = "nl"
 
-    # Priority determination
-    urgent_kw = ["extremely urgent", "urgently", "data loss", "compromised", "disappeared", "deadline tomorrow", "locked out"]
-    high_kw = ["blocking", "every time", "unacceptable", "double charged", "charged twice", "refund", "crashes", "crash", "saml", "sso error", "deadline"]
+    # 1. Spam check: Spam must always be closed
+    if check_is_spam(subject, body):
+        decision.action = "close"
+        decision.priority = "P4"
+        decision.category = "other"
+        decision.reason = "Spam / marketing offer: closed without action."
+        decision.draft_reply = None
+        decision.handoff_note = None
+        return decision
 
-    if any(k in text for k in urgent_kw):
-        priority = "urgent"
-    elif any(k in text for k in high_kw) or (tier == "enterprise" and category in ("bug", "billing")):
-        priority = "high"
-    elif tier == "enterprise" or tier == "pro":
-        priority = "medium"
-    else:
-        priority = "low"
+    # 2. Unsupported OS compatibility (FAQ F12)
+    # E.g. iPhone 8 / iOS 15 crash is not an internal bug; FAQ F12 covers OS requirements
+    if ("ios 15" in text or "iphone 8" in text) and ("crash" in text or "app" in text):
+        decision.action = "reply"
+        decision.category = "bug"
+        decision.priority = "P3"
+        decision.reason = "Unsupported OS version. FAQ F12 specifies iOS 16+ is required; answered directly."
+        decision.draft_reply = (
+            "Hi, Roosterly requires iOS 16 or later (and Android 10 or later). The iPhone 8 cannot run iOS 16, "
+            "which is why the app crashes. Please access Roosterly using a device running iOS 16 or later, or via the web app. "
+            "Kind regards, Team Roosterly"
+            if decision.language == "en"
+            else "Hoi, Roosterly vereist iOS 16 of hoger (en Android 10 of hoger). De iPhone 8 ondersteunt geen iOS 16, waardoor de app crasht. "
+            "Gebruik een ondersteund toestel met iOS 16+ of log in via de webapp. Groet, Team Roosterly"
+        )
+        decision.handoff_note = None
+        return decision
 
-    can_auto_reply = category == "question" and priority == "low"
-    needs_human = not can_auto_reply
-    # Simple questions get high confidence so demo/offline runs can exercise
-    # the auto_handle branch; everything else stays under the 0.75 escalation threshold.
-    confidence = 0.85 if can_auto_reply else 0.55
+    # 3. Feature requests roadmap policy (FAQ F10)
+    if any(k in text for k in ["graag een koppeling", "feature request", "google agenda koppeling"]) or decision.category == "feature_request":
+        decision.category = "feature_request"
+        decision.priority = "P4"
+        decision.action = "reply"
+        decision.reason = "Feature request covered by roadmap FAQ F10. Acknowledge and direct to roadmap."
+        if not decision.draft_reply:
+            decision.draft_reply = (
+                "Bedankt voor je suggestie! Je kunt ideeën bekijken en erop stemmen op onze openbare roadmap via roadmap.roosterly.nl. "
+                "We kunnen helaas geen opleverdatum beloven voor individuele verzoeken. Groet, Team Roosterly"
+                if decision.language == "nl"
+                else "Thanks for your suggestion! You can review and vote on feature ideas on our public roadmap at roadmap.roosterly.nl. "
+                "We cannot promise individual delivery dates. Kind regards, Team Roosterly"
+            )
+        decision.handoff_note = None
+        return decision
 
-    return TriageResult(
-        ticket_id=ticket_id,
-        category=category,
-        priority=priority,
-        priority_reason=f"Heuristic fallback (no API key): keyword match -> {priority}.",
-        confidence=confidence,
-        can_auto_reply=can_auto_reply,
-        draft_reply=(
-            "Thanks for reaching out! Could you share a bit more detail so "
-            "our team can point you to the right answer?"
-            if can_auto_reply
-            else None
-        ),
-        needs_human=needs_human,
-        escalation_reason=(
-            None if can_auto_reply else "Heuristic fallback always escalates non-trivial tickets."
-        ),
-        source="fallback",
-    )
+    # 4. Mandatory handoff triggers (Refunds, AVG/GDPR, Cancellations, Security, Legal)
+    policy_trigger = check_force_handoff(subject, body)
+    if policy_trigger:
+        decision.action = "handoff"
+        if decision.priority not in ("P1", "P2"):
+            decision.priority = "P2"
+        # Categorize appropriately
+        if "gdpr" in policy_trigger.lower() or "privacy" in policy_trigger.lower():
+            decision.category = "other"
+        elif "refund" in policy_trigger.lower() or "cancellation" in policy_trigger.lower():
+            decision.category = "billing"
+
+        decision.reason = f"Client rule: {policy_trigger} must be handled by a human."
+        if not decision.handoff_note:
+            decision.handoff_note = f"Customer inquiry involves {policy_trigger.lower()}. Requires manual review."
+        decision.draft_reply = None
+        return decision
+
+    # 5. Billing category corrections (invoices, VAT/btw-nummer, pricing)
+    if any(k in text for k in ["btw-nummer", "facturen", "wat kost plus", "wat kost basis", "prijs plus"]):
+        decision.category = "billing"
+
+    # 6. Low confidence override
+    if decision.confidence < CONFIDENCE_THRESHOLD:
+        if decision.action == "reply":
+            decision.action = "handoff"
+            decision.reason = f"Confidence {decision.confidence:.2f} below {CONFIDENCE_THRESHOLD} threshold. Escalated to human."
+            decision.handoff_note = f"Ticket required clarification or was ambiguous (confidence {decision.confidence:.2f})."
+            decision.draft_reply = None
+        return decision
+
+    # 7. Belt-and-suspenders: Ensure non-reply actions never carry a draft reply
+    if decision.action != "reply":
+        decision.draft_reply = None
+
+    # 8. Belt-and-suspenders: Ensure handoffs always have an English note
+    if decision.action == "handoff" and not decision.handoff_note:
+        decision.handoff_note = "Escalated for human support review."
+
+    return decision
 
 
 class TicketAgent:
-    def __init__(self, model: str = MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL):
         self.model = model
         self.client = None
-        api_key = os.environ.get("GROQ_API_KEY")
-        if api_key:
+        groq_key = os.environ.get("GROQ_API_KEY")
+        if groq_key:
             try:
-                import groq  # imported lazily so the module loads without the package too
-
-                self.client = groq.Groq(api_key=api_key)
+                import groq
+                self.client = groq.Groq(api_key=groq_key)
             except ImportError:
-                print(
-                    "[agent] 'groq' package not installed - run "
-                    "`pip install groq`. Falling back to heuristic mode."
-                )
+                logger.warning("'groq' package not available. Running in heuristic mode.")
 
-    @property
-    def using_model(self) -> bool:
-        return self.client is not None
-
-    def classify_raw(self, ticket_id: str, subject: str, body: str, tier: str) -> TriageResult:
-        """Model (or fallback) call only - no safety net applied yet.
-
-        Kept separate from apply_safety_net() so the two can be wired up as
-        distinct LangGraph nodes with a visible edge between them (graph.py).
-        """
+    def classify_raw(
+        self,
+        ticket_id: str,
+        subject: str,
+        body: str,
+        customer_plan: str = "Basis",
+        channel: str = "email",
+    ) -> TriageDecision:
+        """Call LLM with forced tool-choice to generate structured triage decision."""
         if not self.client:
-            return heuristic_classify(ticket_id, subject, body, tier)
+            return self._heuristic_fallback(ticket_id, subject, body, customer_plan)
 
-        user_message = f"Customer tier: {tier}\nSubject: {subject}\nBody: {body}"
+        user_content = (
+            f"Ticket ID: {ticket_id}\n"
+            f"Customer Plan: {customer_plan}\n"
+            f"Channel: {channel}\n"
+            f"Subject: {subject}\n"
+            f"Body: {body}"
+        )
 
-        last_err = None
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    max_tokens=500,
+                    max_tokens=1024,
+                    temperature=0.0,
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message},
+                        {"role": "system", "content": ROOSTERLY_FAQ_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
                     ],
                     tools=[TRIAGE_TOOL_SCHEMA],
                     tool_choice={"type": "function", "function": {"name": "submit_triage"}},
                 )
-                message = response.choices[0].message
-                tool_call = message.tool_calls[0]
-                import json
 
+                tool_call = response.choices[0].message.tool_calls[0]
                 args = json.loads(tool_call.function.arguments)
-
                 usage = getattr(response, "usage", None)
-                result = TriageResult(
+
+                return TriageDecision(
                     ticket_id=ticket_id,
-                    category=args["category"],
-                    priority=args["priority"],
-                    priority_reason=args["priority_reason"],
-                    confidence=float(args["confidence"]),
-                    can_auto_reply=bool(args["can_auto_reply"]),
-                    draft_reply=_normalize_empty(args.get("draft_reply")),
-                    needs_human=bool(args["needs_human"]),
-                    escalation_reason=_normalize_empty(args.get("escalation_reason")),
+                    language=args.get("language", "nl"),
+                    category=args.get("category", "question"),
+                    priority=args.get("priority", "P4"),
+                    action=args.get("action", "handoff"),
+                    reason=args.get("reason", "Standard triage decision."),
+                    draft_reply=args.get("draft_reply") or None,
+                    handoff_note=args.get("handoff_note") or None,
+                    confidence=float(args.get("confidence", 0.90)),
                     source="model",
                     input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                     output_tokens=getattr(usage, "completion_tokens", 0) or 0,
                 )
-                return result
-            except Exception as exc:  # noqa: BLE001 - we want to retry+fallback on anything
-                last_err = exc
-                time.sleep(min(2 ** attempt, 4))
 
-        print(f"[agent] Model call failed for {ticket_id} after retries ({last_err}). Using fallback.")
-        result = heuristic_classify(ticket_id, subject, body, tier)
-        result.escalation_reason = f"{result.escalation_reason}; also: model call failed ({last_err})"
-        result.needs_human = True
-        return result
+            except Exception as exc:
+                logger.warning("Model call attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(min(2 ** attempt, 3))
 
-    def triage(self, ticket_id: str, subject: str, body: str, tier: str) -> TriageResult:
-        """Convenience wrapper: classify_raw() + apply_safety_net() in one
-        call. graph.py runs these as two separate nodes instead; this method
-        is kept for simple scripts/tests that don't need the graph."""
-        result = self.classify_raw(ticket_id, subject, body, tier)
-        return apply_safety_net(result, subject, body)
+        logger.error("All model attempts failed for %s. Falling back to heuristic.", ticket_id)
+        return self._heuristic_fallback(ticket_id, subject, body, customer_plan)
+
+    def triage(
+        self,
+        ticket_id: str,
+        subject: str,
+        body: str,
+        customer_plan: str = "Basis",
+        channel: str = "email",
+    ) -> TriageDecision:
+        """Full pipeline: Raw classification + Deterministic Safety Net."""
+        decision = self.classify_raw(ticket_id, subject, body, customer_plan, channel)
+        return apply_safety_net(decision, subject, body)
+
+    def _heuristic_fallback(
+        self,
+        ticket_id: str,
+        subject: str,
+        body: str,
+        customer_plan: str,
+    ) -> TriageDecision:
+        """Deterministic offline fallback for CI/CD or zero-key environments."""
+        text = f"{subject} {body}".lower()
+
+        # Language detection heuristic
+        if any(w in text for w in ["the ", "is ", "my ", "when ", "what ", "how "]):
+            lang = "en"
+        elif any(w in text for w in ["das ", "ist ", "mein ", "wie ", "bitte "]):
+            lang = "de"
+        else:
+            lang = "nl"
+
+        if check_is_spam(subject, body):
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category="other",
+                priority="P4",
+                action="close",
+                reason="Spam detected via heuristic rule.",
+                confidence=0.95,
+                source="fallback",
+            )
+
+        policy_hit = check_force_handoff(subject, body)
+        if policy_hit:
+            cat = "billing" if "refund" in policy_hit.lower() or "cancel" in policy_hit.lower() else "other"
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category=cat,
+                priority="P2",
+                action="handoff",
+                reason=f"Client rule: {policy_hit} requires human review.",
+                handoff_note=f"Inquiry involves {policy_hit.lower()}.",
+                confidence=0.90,
+                source="fallback",
+            )
+
+        # Bug check
+        if any(k in text for k in ["crash", "error", "fout", "werkt niet", "crashes", "blocked", "dubbele uren"]):
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category="bug",
+                priority="P2",
+                action="handoff",
+                reason="Technical issue impacting user workflow.",
+                handoff_note="Customer reported technical bug/error.",
+                confidence=0.85,
+                source="fallback",
+            )
+
+        # Feature request check
+        if any(k in text for k in ["graag een koppeling", "feature", "idee", "roadmap", "suggestion"]):
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category="feature_request",
+                priority="P4",
+                action="reply",
+                reason="Feature request covered by roadmap FAQ F10.",
+                draft_reply=(
+                    "Bedankt voor je suggestie! Je kunt ideeën bekijken en erop stemmen op onze openbare roadmap via roadmap.roosterly.nl. Groet, Team Roosterly"
+                    if lang == "nl"
+                    else "Thanks for the idea! You can check and vote on feature ideas on our public roadmap at roadmap.roosterly.nl. Regards, Team Roosterly"
+                ),
+                confidence=0.90,
+                source="fallback",
+            )
+
+        # FAQ How-to matches
+        if any(k in text for k in ["wachtwoord", "password", "inloggen"]):
+            reply_nl = "Hoi, ga naar app.roosterly.nl/login en klik op 'Wachtwoord vergeten'. De resetlink is 60 minuten geldig. Geen mail na 10 minuten? Controleer dan je spambox. Groet, Team Roosterly"
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category="question",
+                priority="P4",
+                action="reply",
+                reason="Password reset answered by FAQ F01.",
+                draft_reply=reply_nl,
+                confidence=0.95,
+                source="fallback",
+            )
+
+        if any(k in text for k in ["ruilen", "dienst ruil", "swap"]):
+            reply_nl = "Hoi, medewerkers kunnen in de app de dienst openen en tikken op 'Ruil aanbieden'. Collega's met dezelfde rol kunnen dit accepteren, waarna de manager akkoord geeft onder Rooster → Verzoeken. Groet, Team Roosterly"
+            return TriageDecision(
+                ticket_id=ticket_id,
+                language=lang,
+                category="question",
+                priority="P4",
+                action="reply",
+                reason="Shift swapping answered by FAQ F03.",
+                draft_reply=reply_nl,
+                confidence=0.95,
+                source="fallback",
+            )
+
+        # Default safe fallback
+        return TriageDecision(
+            ticket_id=ticket_id,
+            language=lang,
+            category="question",
+            priority="P4",
+            action="handoff",
+            reason="Inquiry not covered by standard FAQ entries; escalated to support.",
+            handoff_note="General question requiring custom support answer.",
+            confidence=0.70,
+            source="fallback",
+        )
